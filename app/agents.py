@@ -1,0 +1,629 @@
+"""All agents.
+
+Each agent is a function that:
+- builds a small, schema-constrained prompt
+- calls `LLMClient.call_llm_json` (or text where appropriate)
+- coerces the response into a Pydantic model
+
+Agents never read OpenAI, env, or DB directly - they go through
+`LLMClient` so the same code runs in real mode, mock mode, and tests.
+"""
+from __future__ import annotations
+
+import json
+from typing import Any, Dict, List, Optional
+
+from . import config as _config_mod
+from .cost_control import compact_evidence_for_agents
+from .llm import LLMClient
+from .rag import retrieve_with_cache
+from .schemas import (
+    AgentOutput,
+    AgentTimelineContribution,
+    DiscussionSummary,
+    EvidenceChunk,
+    EvidenceSummary,
+    RedTeamFinding,
+    TimelineEvent,
+    YearBlock,
+)
+from .utils import SIMULATION_YEARS, truncate
+
+
+# --- Prompts ---------------------------------------------------------------
+
+SAFETY_TAIL = (
+    "\n\nSAFETY: Stay at the strategic / scenario-planning level. "
+    "Do NOT provide operational military tactics, targeting advice, "
+    "weapons guidance, or instructions for real-world harm. Discuss "
+    "escalation, deterrence, gray-zone pressure, crisis stability, and "
+    "de-escalation pathways only."
+)
+
+JSON_TAIL = (
+    "\n\nReturn ONLY a single JSON object that matches the requested schema. "
+    "Be concise. Avoid long essays."
+)
+
+
+DOMAIN_AGENT_SCHEMA_HINT = """
+Required JSON shape:
+{
+  "agent_name": "<your agent name>",
+  "round_number": <int>,
+  "main_assessment": "<2-4 sentences>",
+  "key_drivers": ["<short bullet>", "..."],
+  "timeline_contributions": [
+    {"year": 2026, "event": "<short>", "probability": 0.4,
+     "impact": "low|medium|high", "confidence": "low|medium|high",
+     "rationale": "<one sentence>"}
+  ],
+  "risks": ["..."],
+  "uncertainties": ["..."],
+  "agreements": ["..."],
+  "disagreements": ["..."],
+  "position_changed_from_previous_round": false
+}
+"""
+
+
+AGENT_SYSTEM_PROMPTS: Dict[str, str] = {
+    "geo_strategy": (
+        "You are the Geo-Strategy Agent. Focus on alliances, Indo-Pacific "
+        "strategy, U.S. and Chinese grand strategy, diplomacy, balance of "
+        "power, and likely responses from Japan, South Korea, India, "
+        "ASEAN, Europe, and Australia."
+    ),
+    "economy_technology": (
+        "You are the Economy & Technology Agent. Focus on trade, "
+        "semiconductors, AI chips, rare earths, supply chains, sanctions, "
+        "export controls, tariffs, financial stress, industrial policy, "
+        "and economic decoupling."
+    ),
+    "domestic_ideology": (
+        "You are the Domestic Politics & Ideology Agent. Focus on U.S. "
+        "and Chinese domestic political incentives, CCP legitimacy, "
+        "nationalism, ideology, public opinion, propaganda, regime "
+        "stability pressure, and elite incentives."
+    ),
+    "security_taiwan": (
+        "You are the Security / Taiwan Escalation Agent. Focus on Taiwan "
+        "strategic risk, deterrence, gray-zone pressure, crisis stability, "
+        "high-level military signaling, and escalation / de-escalation "
+        "pathways. NEVER provide operational tactics or targeting advice."
+    ),
+    "historical_analogy": (
+        "You are the Historical Analogy Agent. Compare the scenario to "
+        "historical rivalry patterns (especially U.S.-USSR). Distinguish "
+        "useful analogies from misleading ones. Explain why U.S.-China is "
+        "different due to economic interdependence, technology supply "
+        "chains, and Taiwan."
+    ),
+}
+
+
+# --- Evidence agent --------------------------------------------------------
+
+
+def run_evidence_agent(
+    llm: LLMClient,
+    seed: str,
+    scenario_mode: str,
+) -> tuple:
+    """Returns (EvidenceSummary, retrieved_docs_count, cache_hit)."""
+    chunks: List[EvidenceChunk] = []
+    cache_hit = False
+    if _config_mod.CONFIG.use_rag:
+        chunks, cache_hit = retrieve_with_cache(seed, scenario_mode)
+
+    chunk_blob = "\n\n".join(
+        "SOURCE: {p} ({t}/{d})\n{txt}".format(
+            p=c.source_path,
+            t=c.source_type,
+            d=c.domain,
+            txt=truncate(c.text, 400),
+        )
+        for c in chunks
+    )
+    sources = sorted({c.source_path for c in chunks if c.source_path})
+
+    system = (
+        "You are the Evidence / RAG Agent. Separate observed current "
+        "facts from historical analogies, strategy frameworks, and "
+        "hypothetical assumptions extracted from the user's seed. "
+        "If the seed describes a future event that has not yet happened, "
+        "label it as a 'hypothetical assumption' and do NOT claim it as "
+        "fact. RAG is used only for background context."
+    ) + SAFETY_TAIL + JSON_TAIL
+
+    user = (
+        "Seed: " + seed + "\n"
+        "Scenario mode: " + scenario_mode + "\n\n"
+        "Retrieved context (may be empty):\n" + (chunk_blob or "<none>") + "\n\n"
+        "Required JSON shape:\n"
+        "{\n"
+        '  "observed_facts": ["..."],\n'
+        '  "historical_analogies": ["..."],\n'
+        '  "strategy_frameworks": ["..."],\n'
+        '  "hypothetical_assumptions": ["..."],\n'
+        '  "compact_summary": "<<=400 chars>",\n'
+        '  "note": "<short caveat about retrieval coverage>"\n'
+        "}\n"
+    )
+
+    data = llm.call_llm_json(
+        system_prompt=system,
+        user_prompt=user,
+        agent_name="evidence_rag",
+        round_number=0,
+        schema_name="evidence_summary",
+        cache_context={"seed": seed, "mode": scenario_mode, "n_chunks": len(chunks)},
+        fallback={
+            "observed_facts": [],
+            "historical_analogies": [],
+            "strategy_frameworks": [],
+            "hypothetical_assumptions": [
+                "User seed treated as a hypothetical future event."
+            ],
+            "compact_summary": truncate(
+                "Seed: " + seed + " | Mode: " + scenario_mode, 400
+            ),
+            "note": "Evidence agent fallback used.",
+        },
+    )
+
+    summary = EvidenceSummary(
+        observed_facts=_as_str_list(data.get("observed_facts")),
+        historical_analogies=_as_str_list(data.get("historical_analogies")),
+        strategy_frameworks=_as_str_list(data.get("strategy_frameworks")),
+        hypothetical_assumptions=_as_str_list(data.get("hypothetical_assumptions"))
+        or ["User seed treated as a hypothetical future event."],
+        sources=sources,
+        compact_summary=str(data.get("compact_summary") or "")[:600],
+        note=str(data.get("note") or "")[:300],
+    )
+    return summary, len(chunks), cache_hit
+
+
+# --- Domain agents ---------------------------------------------------------
+
+
+def run_domain_agent(
+    llm: LLMClient,
+    agent_name: str,
+    seed: str,
+    scenario_mode: str,
+    evidence_blob: str,
+    round_number: int,
+    previous_summary: Optional[DiscussionSummary],
+    previous_self_position: Optional[str],
+) -> AgentOutput:
+    if agent_name not in AGENT_SYSTEM_PROMPTS:
+        raise ValueError("Unknown agent: " + agent_name)
+
+    system = (
+        AGENT_SYSTEM_PROMPTS[agent_name]
+        + SAFETY_TAIL
+        + "\n\nWrite as an expert analyst. Be concise."
+        + JSON_TAIL
+    )
+
+    prev_summary_text = ""
+    if previous_summary is not None:
+        prev_summary_text = json.dumps(
+            previous_summary.model_dump(), ensure_ascii=False
+        )
+
+    user = (
+        "Seed: " + seed + "\n"
+        "Scenario mode: " + scenario_mode + "\n"
+        "Years to cover: 2026-2031\n\n"
+        "Compact evidence summary:\n" + evidence_blob + "\n\n"
+        "Discussion round: " + str(round_number) + "\n"
+        "Previous-round discussion summary:\n"
+        + (prev_summary_text or "<none - this is round 1>") + "\n\n"
+        "Your previous position (if any):\n"
+        + (previous_self_position or "<none>") + "\n\n"
+        + DOMAIN_AGENT_SCHEMA_HINT
+    )
+    user = truncate(user, _config_mod.CONFIG.max_agent_input_chars)
+
+    fallback = _domain_fallback(agent_name, round_number)
+    data = llm.call_llm_json(
+        system_prompt=system,
+        user_prompt=user,
+        agent_name=agent_name,
+        round_number=round_number,
+        cache_context={
+            "seed": seed,
+            "mode": scenario_mode,
+            "round": round_number,
+            "prev_pos": previous_self_position or "",
+        },
+        fallback=fallback,
+    )
+    return _to_agent_output(agent_name, round_number, data)
+
+
+# --- Red-Team agent --------------------------------------------------------
+
+
+def run_red_team_agent(
+    llm: LLMClient,
+    seed: str,
+    scenario_mode: str,
+    evidence_blob: str,
+    final_round_summary: Optional[DiscussionSummary],
+) -> tuple:
+    """Returns (AgentOutput, List[RedTeamFinding])."""
+    system = (
+        "You are the Red-Team Agent. Challenge the scenario: find "
+        "contradictions, missing variables, overconfident assumptions, "
+        "and what would make the scenario wrong. Prevent easy consensus. "
+        "Assign uncertainty. Stay strategic, not operational."
+    ) + SAFETY_TAIL + JSON_TAIL
+
+    summary_text = (
+        json.dumps(final_round_summary.model_dump(), ensure_ascii=False)
+        if final_round_summary is not None
+        else "<no discussion summary>"
+    )
+
+    user = (
+        "Seed: " + seed + "\n"
+        "Scenario mode: " + scenario_mode + "\n\n"
+        "Compact evidence:\n" + evidence_blob + "\n\n"
+        "Final discussion summary:\n" + summary_text + "\n\n"
+        "Return JSON with:\n"
+        + DOMAIN_AGENT_SCHEMA_HINT
+        + "\nPlus a 'findings' array of "
+        '{"issue": "...", "severity": "low|medium|high", '
+        '"affected_assumption": "..."} objects.'
+    )
+    user = truncate(user, _config_mod.CONFIG.max_agent_input_chars)
+
+    fallback = _domain_fallback("red_team", 1)
+    fallback["findings"] = [
+        {
+            "issue": "Linear escalation assumption may be too smooth.",
+            "severity": "medium",
+            "affected_assumption": "Steady decoupling",
+        }
+    ]
+    data = llm.call_llm_json(
+        system_prompt=system,
+        user_prompt=user,
+        agent_name="red_team",
+        round_number=99,
+        schema_name="red_team",
+        cache_context={"seed": seed, "mode": scenario_mode},
+        fallback=fallback,
+    )
+
+    output = _to_agent_output("red_team", round_number=99, data=data)
+    findings: List[RedTeamFinding] = []
+    for raw in data.get("findings") or []:
+        if not isinstance(raw, dict):
+            continue
+        findings.append(
+            RedTeamFinding(
+                issue=str(raw.get("issue") or "")[:300],
+                severity=str(raw.get("severity") or "medium")[:10],
+                affected_assumption=str(raw.get("affected_assumption") or "")[:200],
+            )
+        )
+    return output, findings
+
+
+# --- Orchestrator agents ---------------------------------------------------
+
+
+def run_orchestrator_summary(
+    llm: LLMClient,
+    seed: str,
+    scenario_mode: str,
+    round_number: int,
+    latest_outputs: Dict[str, AgentOutput],
+) -> DiscussionSummary:
+    """LLM-backed compaction of a discussion round.
+
+    If the model misbehaves, we fall back to a deterministic heuristic
+    summary (`cost_control.build_discussion_summary`).
+    """
+    from .cost_control import build_discussion_summary
+
+    positions_blob = "\n".join(
+        "- {a}: {p}".format(
+            a=name,
+            p=truncate(out.main_assessment + " | drivers=" + ",".join(out.key_drivers[:3]), 350),
+        )
+        for name, out in latest_outputs.items()
+    )
+
+    system = (
+        "You are the Orchestrator. Compress this discussion round into a "
+        "compact JSON summary used as input for the next round. Do not "
+        "invent positions agents did not take."
+    ) + JSON_TAIL
+
+    user = (
+        "Seed: " + seed + "\n"
+        "Mode: " + scenario_mode + "\n"
+        "Round: " + str(round_number) + "\n\n"
+        "Agent positions:\n" + positions_blob + "\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "round_number": ' + str(round_number) + ",\n"
+        '  "areas_of_agreement": [],\n'
+        '  "areas_of_disagreement": [],\n'
+        '  "emerging_timeline": ["2026: ...", "2027: ..."],\n'
+        '  "key_uncertainties": [],\n'
+        '  "agent_positions": {"geo_strategy": "...", "economy_technology": "..."}\n'
+        "}\n"
+    )
+    user = truncate(user, _config_mod.CONFIG.max_agent_input_chars)
+
+    heuristic = build_discussion_summary(round_number, latest_outputs)
+    data = llm.call_llm_json(
+        system_prompt=system,
+        user_prompt=user,
+        agent_name="orchestrator_summary",
+        round_number=round_number,
+        schema_name="discussion_summary",
+        cache_context={"round": round_number, "n": len(latest_outputs)},
+        fallback=heuristic.model_dump(),
+    )
+
+    try:
+        return DiscussionSummary(
+            round_number=int(data.get("round_number") or round_number),
+            areas_of_agreement=_as_str_list(data.get("areas_of_agreement")),
+            areas_of_disagreement=_as_str_list(data.get("areas_of_disagreement")),
+            emerging_timeline=_as_str_list(data.get("emerging_timeline")),
+            key_uncertainties=_as_str_list(data.get("key_uncertainties")),
+            agent_positions={
+                k: str(v)[:400]
+                for k, v in (data.get("agent_positions") or {}).items()
+                if isinstance(k, str)
+            },
+        )
+    except Exception:
+        return heuristic
+
+
+def run_orchestrator_final_synthesis(
+    llm: LLMClient,
+    seed: str,
+    scenario_mode: str,
+    evidence: EvidenceSummary,
+    last_summary: Optional[DiscussionSummary],
+    domain_outputs: Dict[str, AgentOutput],
+    red_team: AgentOutput,
+    red_team_findings: List[RedTeamFinding],
+) -> Dict[str, Any]:
+    """LLM-backed final synthesis.
+
+    Returns a dict with: scenario_title, scenario_summary, event_status,
+    key_assumptions, main_disagreements, image_prompt. The Orchestrator
+    deterministically builds the full per-year timeline (see
+    `build_final_timeline` below) from the agent contributions.
+    """
+    system = (
+        "You are the Orchestrator. Synthesize one PLAUSIBLE (not "
+        "predicted) USA-China rivalry scenario for 2026-2031. Merge all "
+        "agent perspectives. Preserve disagreements. Phrase as 'one "
+        "plausible scenario'. Generate a non-graphic editorial image "
+        "prompt that emphasizes diplomacy, trade, and technology."
+    ) + SAFETY_TAIL + JSON_TAIL
+
+    positions = "\n".join(
+        "- {n}: {p}".format(n=k, p=truncate(v.main_assessment, 200))
+        for k, v in domain_outputs.items()
+    )
+    findings = "\n".join(
+        "- [{s}] {i}".format(s=f.severity, i=f.issue) for f in red_team_findings[:6]
+    )
+    last_summary_txt = (
+        json.dumps(last_summary.model_dump(), ensure_ascii=False)
+        if last_summary is not None
+        else "<none>"
+    )
+
+    user = (
+        "Seed: " + seed + "\n"
+        "Mode: " + scenario_mode + "\n"
+        "Evidence note: " + (evidence.note or "") + "\n"
+        "Compact evidence: " + (evidence.compact_summary or "") + "\n\n"
+        "Final discussion summary:\n" + last_summary_txt + "\n\n"
+        "Agent assessments:\n" + positions + "\n\n"
+        "Red-team findings:\n" + (findings or "<none>") + "\n\n"
+        "Return JSON:\n"
+        "{\n"
+        '  "scenario_title": "<short>",\n'
+        '  "scenario_summary": "<3-5 sentences>",\n'
+        '  "event_status": "observed|hypothetical|mixed",\n'
+        '  "key_assumptions": ["..."],\n'
+        '  "main_disagreements": ["..."],\n'
+        '  "image_prompt": "<editorial illustration prompt>"\n'
+        "}\n"
+    )
+    user = truncate(user, _config_mod.CONFIG.max_agent_input_chars)
+
+    fallback = {
+        "scenario_title": "One Plausible USA-China Rivalry Path (2026-2031)",
+        "scenario_summary": (
+            "A synthesized, non-predictive scenario built from multi-agent "
+            "analysis of " + truncate(seed, 200) + "."
+        ),
+        "event_status": "hypothetical",
+        "key_assumptions": ["No major hot war between great powers."],
+        "main_disagreements": [d for d in (last_summary.areas_of_disagreement if last_summary else [])][:5],
+        "image_prompt": "",
+    }
+    data = llm.call_llm_json(
+        system_prompt=system,
+        user_prompt=user,
+        agent_name="orchestrator_final",
+        round_number=999,
+        schema_name="final_synthesis",
+        cache_context={"seed": seed, "mode": scenario_mode},
+        fallback=fallback,
+    )
+
+    return {
+        "scenario_title": str(data.get("scenario_title") or fallback["scenario_title"])[:200],
+        "scenario_summary": str(data.get("scenario_summary") or fallback["scenario_summary"])[:1200],
+        "event_status": str(data.get("event_status") or "hypothetical")[:20],
+        "key_assumptions": _as_str_list(data.get("key_assumptions"))
+        or fallback["key_assumptions"],
+        "main_disagreements": _as_str_list(data.get("main_disagreements"))
+        or fallback["main_disagreements"],
+        "image_prompt": str(data.get("image_prompt") or "")[:1200],
+    }
+
+
+def classify_event_status(seed: str) -> str:
+    """Cheap, deterministic classifier used during state init.
+
+    The Orchestrator's LLM synthesis may override this later. We use it
+    so the API can echo back an event_status even if synthesis fails.
+    """
+    s = (seed or "").lower()
+    future_markers = (
+        "will", "would", "if ", "suppose", "hypothetical", "imagine",
+        "what if", "scenario where", "unexpectedly",
+    )
+    past_markers = ("happened", "yesterday", "last year", "in 2024", "in 2023")
+    has_future = any(m in s for m in future_markers)
+    has_past = any(m in s for m in past_markers)
+    if has_future and has_past:
+        return "mixed"
+    if has_future:
+        return "hypothetical"
+    return "hypothetical"
+
+
+# --- Timeline assembly -----------------------------------------------------
+
+
+def build_final_timeline(
+    domain_outputs: Dict[str, AgentOutput],
+) -> List[YearBlock]:
+    """Deduplicate and group all domain agent contributions per year."""
+    domain_for_agent = {
+        "geo_strategy": "strategy",
+        "economy_technology": "economy",
+        "domestic_ideology": "ideology",
+        "security_taiwan": "security",
+        "historical_analogy": "historical",
+    }
+    by_year: Dict[int, List[TimelineEvent]] = {y: [] for y in SIMULATION_YEARS}
+    seen_per_year: Dict[int, set] = {y: set() for y in SIMULATION_YEARS}
+
+    for agent_name, output in domain_outputs.items():
+        domain = domain_for_agent.get(agent_name, "strategy")
+        for tc in output.timeline_contributions:
+            year = int(tc.year) if tc.year else 2026
+            if year not in by_year:
+                # Clamp to nearest simulation year
+                year = min(SIMULATION_YEARS, key=lambda y: abs(y - year))
+            key = (tc.event or "").strip().lower()[:80]
+            if not key or key in seen_per_year[year]:
+                continue
+            seen_per_year[year].add(key)
+            by_year[year].append(
+                TimelineEvent(
+                    event=tc.event,
+                    domain=domain,
+                    probability=tc.probability,
+                    impact=tc.impact,
+                    confidence=tc.confidence,
+                    rationale=tc.rationale,
+                )
+            )
+
+    blocks: List[YearBlock] = []
+    for year in SIMULATION_YEARS:
+        events = by_year[year]
+        headline = ""
+        if events:
+            top = max(events, key=lambda e: (e.probability, _impact_weight(e.impact)))
+            headline = truncate(top.event, 140)
+        blocks.append(YearBlock(year=year, headline=headline, events=events))
+    return blocks
+
+
+def _impact_weight(impact: str) -> int:
+    return {"low": 1, "medium": 2, "high": 3}.get((impact or "").lower(), 2)
+
+
+# --- Internals -------------------------------------------------------------
+
+
+def _as_str_list(value: Any) -> List[str]:
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, list):
+        return [str(v)[:400] for v in value if v is not None]
+    return []
+
+
+def _to_agent_output(agent_name: str, round_number: int, data: Dict[str, Any]) -> AgentOutput:
+    contribs: List[AgentTimelineContribution] = []
+    for raw in data.get("timeline_contributions") or []:
+        if not isinstance(raw, dict):
+            continue
+        try:
+            contribs.append(
+                AgentTimelineContribution(
+                    year=int(raw.get("year") or 2026),
+                    event=str(raw.get("event") or "")[:300],
+                    probability=float(raw.get("probability") or 0.5),
+                    impact=str(raw.get("impact") or "medium")[:10],
+                    confidence=str(raw.get("confidence") or "medium")[:10],
+                    rationale=str(raw.get("rationale") or "")[:400],
+                )
+            )
+        except Exception:
+            continue
+    return AgentOutput(
+        agent_name=agent_name,
+        round_number=round_number,
+        main_assessment=str(data.get("main_assessment") or "")[:1500],
+        key_drivers=_as_str_list(data.get("key_drivers")),
+        timeline_contributions=contribs,
+        risks=_as_str_list(data.get("risks")),
+        uncertainties=_as_str_list(data.get("uncertainties")),
+        agreements=_as_str_list(data.get("agreements")),
+        disagreements=_as_str_list(data.get("disagreements")),
+        position_changed_from_previous_round=bool(
+            data.get("position_changed_from_previous_round")
+        ),
+    )
+
+
+def _domain_fallback(agent_name: str, round_number: int) -> Dict[str, Any]:
+    return {
+        "agent_name": agent_name,
+        "round_number": round_number,
+        "main_assessment": "[fallback] structured response unavailable.",
+        "key_drivers": [],
+        "timeline_contributions": [
+            {
+                "year": y,
+                "event": "[fallback] no input from " + agent_name,
+                "probability": 0.3,
+                "impact": "low",
+                "confidence": "low",
+                "rationale": "fallback",
+            }
+            for y in (2026, 2028, 2030)
+        ],
+        "risks": [],
+        "uncertainties": [],
+        "agreements": [],
+        "disagreements": [],
+        "position_changed_from_previous_round": False,
+    }

@@ -1,0 +1,131 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Cold War Scenario Simulator</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark"></div>
+      <div>
+        <h1>Cold War Scenario Simulator</h1>
+        <p class="subtitle">
+          Multi-agent geopolitical scenario planning for USA&ndash;China rivalry, 2026&ndash;2031
+        </p>
+      </div>
+    </div>
+    <div class="model-pill" id="modelPill">model: &mdash;</div>
+  </header>
+
+  <main class="layout">
+    <aside class="sidebar">
+      <section class="panel input-panel">
+        <h2>Run a simulation</h2>
+        <label for="seed">Seed sentence</label>
+        <textarea id="seed" rows="4" placeholder="e.g. China enters a major financial crisis after a real-estate banking shock."></textarea>
+
+        <label for="mode">Scenario mode</label>
+        <select id="mode">
+          <option value="base_case">Base Case</option>
+          <option value="escalation">Escalation</option>
+          <option value="de_escalation">De-escalation</option>
+          <option value="wildcard">Wildcard</option>
+        </select>
+
+        <div class="examples">
+          <span>Examples:</span>
+          <button class="chip" data-seed="China enters a major financial crisis after a real-estate banking shock.">Financial crisis</button>
+          <button class="chip" data-seed="The U.S. announces a new wave of AI chip export controls.">Chip export controls</button>
+          <button class="chip" data-seed="Taiwan elects a more independence-leaning government.">Taiwan election</button>
+          <button class="chip" data-seed="A major cyberattack disrupts global semiconductor supply chains.">Cyberattack</button>
+          <button class="chip" data-seed="China and the U.S. unexpectedly restart high-level trade negotiations.">Trade restart</button>
+        </div>
+
+        <button id="run" class="primary">Run Simulation</button>
+        <div id="status" class="status"></div>
+      </section>
+
+      <section class="panel">
+        <h2>Pipeline progress</h2>
+        <ol id="progress" class="progress-list">
+          <li data-step="init">Orchestrator initialization</li>
+          <li data-step="evidence">Evidence / RAG</li>
+          <li data-step="round1">Discussion Round 1</li>
+          <li data-step="round2">Discussion Round 2</li>
+          <li data-step="round3">Discussion Round 3</li>
+          <li data-step="red_team">Red-Team</li>
+          <li data-step="synthesis">Final Synthesis</li>
+          <li data-step="image">Image Generation</li>
+          <li data-step="save">Save Run</li>
+        </ol>
+      </section>
+
+      <section class="panel">
+        <h2>Saved runs</h2>
+        <ul id="savedRuns" class="saved-runs"></ul>
+      </section>
+    </aside>
+
+    <section class="content">
+      <div id="empty" class="empty">
+        <p>Enter a seed and click <strong>Run Simulation</strong>.</p>
+        <p class="muted">All agents will run; results appear here.</p>
+      </div>
+
+      <div id="result" class="result hidden">
+        <header class="result-header">
+          <h2 id="scenarioTitle"></h2>
+          <span id="statusBadge" class="badge"></span>
+        </header>
+        <p id="scenarioSummary" class="summary"></p>
+
+        <section class="panel">
+          <h3>Timeline 2026&ndash;2031</h3>
+          <div id="timeline" class="timeline"></div>
+        </section>
+
+        <div class="grid-2">
+          <section class="panel">
+            <h3>Agent discussion</h3>
+            <div id="discussion"></div>
+          </section>
+          <section class="panel">
+            <h3>Agent summaries</h3>
+            <div id="agentSummaries"></div>
+          </section>
+        </div>
+
+        <div class="grid-2">
+          <section class="panel">
+            <h3>Main disagreements</h3>
+            <ul id="disagreements" class="bullets"></ul>
+          </section>
+          <section class="panel">
+            <h3>Red-team warnings</h3>
+            <ul id="redTeam" class="bullets"></ul>
+          </section>
+        </div>
+
+        <section class="panel image-panel">
+          <h3>Generated illustration</h3>
+          <div id="imageBox" class="image-box"></div>
+          <details class="prompt-details">
+            <summary>Image prompt</summary>
+            <p id="imagePrompt" class="muted small"></p>
+          </details>
+        </section>
+
+        <section class="panel">
+          <h3>Run metrics</h3>
+          <div id="metrics" class="metrics"></div>
+        </section>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>
